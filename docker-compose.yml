@@ -1,0 +1,34 @@
+services:
+  api:
+    build: .
+    image: large-file-search:latest
+    container_name: large-file-search
+    ports:
+      - "8000:8000"
+    volumes:
+      # Uploads, FAISS indexes and the SQLite database. Persisting this is what
+      # lets an interrupted upload resume after the container restarts.
+      - ./data:/app/data
+    environment:
+      DATA_DIR: /app/data
+      WORKER_COUNT: "2"
+      EMBED_BATCH_SIZE: "32"
+      MAX_CHUNK_BYTES: "16777216"
+    # The assignment's constraint, enforced rather than assumed: the container
+    # is capped at 4 GB, so an accidental full-file read fails here instead of
+    # silently passing on a larger dev machine.
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    restart: unless-stopped
+
+  # Runs the suite against the same image, then exits. `--profile test` keeps it
+  # out of the default `docker compose up`.
+  tests:
+    build: .
+    image: large-file-search:latest
+    profiles: ["test"]
+    command: ["python", "-m", "pytest", "-q"]
+    environment:
+      DATA_DIR: /tmp/test-data

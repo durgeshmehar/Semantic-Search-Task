@@ -1,0 +1,17 @@
+data/
+*.partial
+*.dat
+*.faiss
+*.faiss.tmp
+metadata.db*
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+.idea/
+.vscode/
+.DS_Store
