@@ -9,6 +9,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.openapi.utils import get_openapi
 
 from . import config, db, search, upload, vector_store
 from .pipeline import job_queue, worker
@@ -61,7 +62,9 @@ app = FastAPI(
         "Every request takes an `X-User-Id` header identifying the caller "
         "(any string; omit it and requests share one anonymous identity). "
         "Files are scoped to their owner -- listing, status, search, and "
-        "delete only see files created under the same `X-User-Id`.\n\n"
+        "delete only see files created under the same `X-User-Id`. Click "
+        "**Authorize** below and set it once to have it applied to every "
+        "request tried from this page.\n\n"
         "**Upload flow**\n"
         "1. `POST /files` to register the upload and get a `file_id`.\n"
         "2. `PUT /files/{file_id}/chunk?offset=N` repeatedly with raw chunk bodies.\n"
@@ -72,10 +75,51 @@ app = FastAPI(
         "Indexing runs during the upload, so passages become searchable before "
         "`complete` is even called."
     ),
+    # Keeps the X-User-Id value entered via "Authorize" (below) filled in
+    # across page reloads and every "Try it out" call, instead of it
+    # resetting per request or per endpoint.
+    swagger_ui_parameters={"persistAuthorization": True},
 )
 
 app.include_router(upload.router)
 app.include_router(search.router)
+
+
+def _custom_openapi() -> dict:
+    """Register X-User-Id as a real security scheme.
+
+    Without this, Swagger has no "Authorize" button for a plain header
+    parameter -- every endpoint would need X-User-Id typed in separately, by
+    hand, per try. Declaring it as an apiKey security scheme applied to every
+    route gives Swagger one Authorize dialog that then auto-fills the header
+    on every request tried from the page.
+    """
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    schema["components"]["securitySchemes"] = {
+        "UserId": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-User-Id",
+            "description": "Any string identifying the caller. Files are scoped to it.",
+        }
+    }
+    for path in schema["paths"].values():
+        for operation in path.values():
+            operation.setdefault("security", []).append({"UserId": []})
+
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = _custom_openapi
 
 
 @app.get("/health", tags=["meta"], summary="Liveness, worker, and Qdrant state")

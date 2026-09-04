@@ -50,60 +50,69 @@ curl -s -X POST "http://localhost:8000/files/$FILE_ID/search" $H \
 
 ## Architecture
 
-Interactive version with side-by-side comparisons: **[Upload Pipeline Architecture](https://claude.ai/code/artifact/cd179b70-8d75-43b0-b6a8-20cace46a689)**
+Interactive version with a side-by-side race-condition comparison:
+**[Upload Pipeline Architecture](https://claude.ai/code/artifact/cd179b70-8d75-43b0-b6a8-20cace46a689)**
 
-```
-UPLOAD PATH  (synchronous — the client waits for this, and only this)
+```mermaid
+flowchart TB
+    client(["Client"])
 
-  client
-    │  PUT /files/{id}/chunk?offset=N
-    ▼
-  upload handler ── append bytes to {id}.partial
-                 ── split into line-aligned passages
-                 ── enqueue passage rows in SQLite
-    │
-    ▼
-  response (bytes_received, upload_status)
+    subgraph api["API container"]
+        direction TB
+        limiter{{"upload_limiter — max concurrent uploads"}}
+        handler["Upload handler — synchronous<br/>append bytes, split into passages, enqueue rows"]
+        queue[("SQLite WAL — files and chunks<br/>the durable job queue")]
+        workers["Worker pool — asynchronous<br/>claim, read text, embed, upsert"]
+        search["Search handler — synchronous<br/>embed query, resolve hit, read text"]
+    end
 
+    subgraph qdrant["Qdrant container"]
+        collection[("Per-file collection<br/>HNSW, on disk, int8 quantized")]
+    end
 
-INDEXING PATH  (asynchronous — runs continuously, off the request)
+    disk[("Local disk<br/>partial file promoted to final file")]
 
-  SQLite chunks table  ──poll──▶  worker pool (×2)
-  (pending → processing              │
-   → indexed | failed)               ├─ read_range()   → text from disk
-                                      ├─ embed()        → 384-dim vector
-                                      └─ upsert()       ─────────────┐
-                                                                      ▼
-                                                          Qdrant collection
-                                                          (HNSW · on disk ·
-                                                           int8 quantized)
+    client -->|"PUT chunk at offset"| limiter
+    limiter -->|"slot free"| handler
+    limiter -.->|"503, retry shortly, if full"| client
+    handler -->|"append bytes"| disk
+    handler -->|"enqueue"| queue
+    handler -->|"bytes received"| client
 
+    queue -->|"poll pending rows"| workers
+    workers -->|"read byte range"| disk
+    workers -->|"upsert vector"| collection
+    workers -->|"mark indexed"| queue
 
-SEARCH PATH  (synchronous — one request touches both stores)
+    client -->|"search query"| search
+    search -->|"nearest neighbors"| collection
+    collection -->|"byte range and score"| search
+    search -->|"read byte range"| disk
+    search -->|"text and score"| client
 
-  client
-    │  POST /files/{id}/search  {"query": "..."}
-    ▼
-  embed query ──▶ Qdrant nearest-neighbor search ──▶ (byte range, score)
-                                                            │
-                                                            ▼
-                                              seek() the file on disk → text
-                                                            │
-                                                            ▼
-                                                        response
+    style handler fill:#f2d9a8,stroke:#b6721f,color:#1c1a17
+    style search fill:#f2d9a8,stroke:#b6721f,color:#1c1a17
+    style limiter fill:#f2d9a8,stroke:#b6721f,color:#1c1a17
+    style workers fill:#e8e4dc,stroke:#8b8477,color:#1c1a17
+    style queue fill:#d9ebe6,stroke:#2f6f66,color:#1c1a17
+    style collection fill:#d9ebe6,stroke:#2f6f66,color:#1c1a17
+    style disk fill:#ffffff,stroke:#b8b09e,color:#1c1a17
 ```
 
 The one decision this follows from: **`PUT /chunk` never waits on embedding.** It appends bytes,
 splits lines, and enqueues — all cheap — then returns. Embedding happens later, off the request, in
 a worker pool reading the same SQLite queue. Search is the only path touching both Qdrant and disk
-in one request, because a hit is a byte range that still has to be read back as text.
+in one request, because a hit is a byte range that still has to be read back as text. The
+`upload_limiter` gate is the one piece of backpressure on the upload path itself — see §1.
 
 ---
 
 ## API
 
-Interactive documentation: **`/docs`**. Every route requires `X-User-Id`; a file owned by someone
-else 404s.
+Interactive documentation: **`/docs`** (Swagger UI — click **Authorize**, set `X-User-Id` once, then
+"Try it out" on any endpoint to fire real requests against the running service with that header
+applied automatically). A read-only, non-interactive reference is at **`/redoc`**. Every route
+requires `X-User-Id`; a file owned by someone else 404s.
 
 | Method | Path | Purpose |
 |---|---|---|
