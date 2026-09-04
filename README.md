@@ -343,8 +343,7 @@ Deliberate scope choices, given the 4 GB target and the "not production-ready" n
 
 ## AI tools used
 
-Built with **Claude Code** (Claude Opus 5) as a pair-programming assistant: design discussion,
-implementation, tests, and this README.
+Built with **Claude Code**.
 
 How the output was validated and corrected:
 
