@@ -107,6 +107,48 @@ def test_upload_beyond_max_file_bytes_is_rejected(client, monkeypatch):
     assert response.status_code == 400
 
 
+def test_binary_first_chunk_is_rejected(client):
+    """A non-text upload is refused before anything is written or queued."""
+    png_signature = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 30
+    response = client.post(
+        "/files", json={"filename": "photo.png", "total_size": len(png_signature)}
+    )
+    file_id = response.json()["file_id"]
+
+    response = client.put(
+        f"/files/{file_id}/chunk", params={"offset": 0}, content=png_signature
+    )
+    assert response.status_code == 415
+
+    from app import storage
+
+    # Nothing should have been written for a rejected first chunk.
+    assert storage.current_size(file_id) == 0
+
+
+def test_binary_check_only_applies_to_the_first_chunk(client):
+    """Once an upload is underway, later chunks aren't re-scanned.
+
+    A control byte appearing deep in an otherwise-legitimate text file (rare,
+    but not impossible in real logs) shouldn't retroactively fail an upload
+    that already passed its initial check.
+    """
+    first = b"clean text content\n" * 50
+    second = b"\x00\x01\x02more bytes after a stray control byte\n"
+    response = client.post(
+        "/files", json={"filename": "log.txt", "total_size": len(first) + len(second)}
+    )
+    file_id = response.json()["file_id"]
+
+    r1 = client.put(f"/files/{file_id}/chunk", params={"offset": 0}, content=first)
+    assert r1.status_code == 200
+
+    r2 = client.put(
+        f"/files/{file_id}/chunk", params={"offset": len(first)}, content=second
+    )
+    assert r2.status_code == 200  # not re-checked, so not rejected
+
+
 def test_upload_may_exceed_its_own_declared_total_size(client):
     """total_size is a sizing hint, not a hard cap -- real bytes may exceed it."""
     response = client.post("/files", json={"filename": "s.log", "total_size": 10})

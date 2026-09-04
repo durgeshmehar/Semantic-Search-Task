@@ -252,6 +252,7 @@ a boundary isn't embedded as two meaningless fragments.
 |---|---|
 | [app/upload.py](app/upload.py) | Chunked upload, completion, offset validation, status |
 | [app/upload_limiter.py](app/upload_limiter.py) | Caps concurrent chunk uploads held in memory |
+| [app/text_detection.py](app/text_detection.py) | Rejects binary uploads on their first chunk |
 | [app/identity.py](app/identity.py) | `X-User-Id` → caller id, for ownership scoping |
 | [app/search.py](app/search.py) | Query embedding, Qdrant lookup, byte-range reads |
 | [app/pipeline/line_buffer.py](app/pipeline/line_buffer.py) | Bytes → line-aligned passage ranges |
@@ -275,6 +276,8 @@ docker compose --profile test run --rm tests
 - **`test_concurrency.py`** — racing identical chunk requests: exactly one succeeds.
 - **`test_upload_limiter.py`** — the concurrent-upload cap: peak concurrent holders never exceeds
   the limit, a full set of slots rejects cleanly, a released slot is reusable.
+- **`test_text_detection.py`** — the binary/text boundary: null bytes and common binary signatures
+  (PNG, PDF, zip) are rejected, a chunk boundary landing mid-multibyte-character is not.
 - **`test_job_queue.py`** — exclusive claiming, retry-then-fail, crash recovery.
 - **`test_config.py`** — a 10 GB file's resident footprint stays within budget.
 - **`test_search.py`** — the assignment's example, ranking, byte offsets, search mid-upload.
@@ -294,7 +297,9 @@ chunk uploads resulted in exactly 3 accepted and 5 rejected with `503`/`Retry-Af
 - **One API process** — the worker pool is in-process; scaling out means the changes in §6.
 - **One Qdrant collection per file** — simple at this scale, but a shared collection with a filter
   is the better trade past a few thousand files.
-- **Text files only**, no PDF/DOCX extraction.
+- **Text files only**, no PDF/DOCX extraction — a binary upload's first chunk is checked for null
+  bytes and invalid UTF-8 and rejected with `415` before anything is written or indexed
+  ([app/text_detection.py](app/text_detection.py)), rather than silently indexing decode-noise.
 - **Identity, not authentication** — `X-User-Id` is trusted as given; a real deployment would put an
   auth layer in front of it.
 - **Startup crash-recovery assumes one process** — safe because it runs before the server accepts

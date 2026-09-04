@@ -17,7 +17,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
-from . import config, db, models, storage, upload_limiter, vector_store
+from . import config, db, models, storage, text_detection, upload_limiter, vector_store
 from .identity import get_user_id
 from .pipeline import job_queue
 from .pipeline.line_buffer import LineBuffer
@@ -121,6 +121,10 @@ def create_upload(
         404: {"model": models.ErrorResponse, "description": "Unknown file"},
         409: {"model": models.ErrorResponse, "description": "Offset mismatch"},
         413: {"model": models.ErrorResponse, "description": "Chunk too large"},
+        415: {
+            "model": models.ErrorResponse,
+            "description": "Content looks like binary, not text",
+        },
         503: {
             "model": models.ErrorResponse,
             "description": "Too many uploads in progress; retry shortly",
@@ -225,6 +229,18 @@ async def _handle_chunk(
                 status.HTTP_400_BAD_REQUEST,
                 f"upload would exceed the maximum allowed size of "
                 f"{config.MAX_FILE_BYTES} bytes",
+            )
+
+        # Checked only on the first chunk of a fresh upload: nothing on disk
+        # or in the queue yet to unwind, and binary content reveals itself in
+        # the first few KB (a PDF header, a PNG signature, a zip's local file
+        # header). Rejecting here avoids indexing a file that can only ever
+        # return decode-noise from search -- see app/text_detection.py.
+        if offset == 0 and text_detection.looks_like_binary(body):
+            raise HTTPException(
+                status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                "this looks like a binary file, not text -- this service "
+                "only supports UTF-8 text files",
             )
 
         # The file on disk is the source of truth for how much we really have.
