@@ -23,7 +23,6 @@ def _bool_env(name: str, default: bool) -> bool:
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data")).resolve()
 UPLOAD_DIR = DATA_DIR / "uploads"
-INDEX_DIR = DATA_DIR / "indexes"
 DB_PATH = DATA_DIR / "metadata.db"
 
 # --- Upload ---------------------------------------------------------------
@@ -111,13 +110,16 @@ EMBED_BATCH_SIZE = _int_env("EMBED_BATCH_SIZE", 32)
 # proportional throughput.
 WORKER_COUNT = _int_env("WORKER_COUNT", 2)
 
-# Store vectors as int8 rather than float32: 384 B/vector instead of 1536 B,
-# which is what brings a 10 GB file's index down to ~420 MB. Costs ~2-3% recall.
-USE_QUANTIZATION = _bool_env("USE_QUANTIZATION", True)
+# --- Vector store (Qdrant) -------------------------------------------------
 
-# Below this many vectors a quantized index isn't worth training, so we keep a
-# plain flat index. Only matters for small files and tests.
-QUANTIZATION_MIN_VECTORS = _int_env("QUANTIZATION_MIN_VECTORS", 4096)
+QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
+
+# Keep the int8-quantized vectors resident for search speed, while raw
+# float32 vectors and the HNSW graph stay on disk (see vector_store.py). This
+# is the actual RAM lever now: quantized vectors are 384 B each, so the
+# resident set for even a 10 GB file's ~2.8M passages is under 1.1 GB -- see
+# README section 1 for the sizing table this replaced.
+QUANTIZATION_ALWAYS_RAM = _bool_env("QUANTIZATION_ALWAYS_RAM", True)
 
 # --- Job queue ------------------------------------------------------------
 
@@ -139,4 +141,3 @@ MAX_TOP_K = _int_env("MAX_TOP_K", 100)
 def ensure_dirs() -> None:
     """Create the on-disk layout. Safe to call repeatedly."""
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    INDEX_DIR.mkdir(parents=True, exist_ok=True)

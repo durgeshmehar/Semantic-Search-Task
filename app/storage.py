@@ -7,6 +7,8 @@ all -- a reader can never observe a half-written file under the final name.
 That final file is also the text store: chunk rows hold byte offsets into it,
 and search reads passages back with seek()+read rather than keeping a second
 copy of the corpus in the database.
+
+Vector storage lives in Qdrant (see vector_store.py), not on this filesystem.
 """
 
 from pathlib import Path
@@ -22,11 +24,6 @@ def partial_path(file_id: str) -> Path:
 def final_path(file_id: str) -> Path:
     """Where a completed upload lives."""
     return config.UPLOAD_DIR / f"{file_id}.dat"
-
-
-def index_path(file_id: str) -> Path:
-    """This file's FAISS index."""
-    return config.INDEX_DIR / f"{file_id}.faiss"
 
 
 def readable_path(file_id: str) -> Path | None:
@@ -107,6 +104,10 @@ def read_range(file_id: str, start: int, end: int) -> str:
 
 
 def delete_all(file_id: str) -> None:
-    """Remove every artifact for a file."""
-    for path in (partial_path(file_id), final_path(file_id), index_path(file_id)):
+    """Remove this file's on-disk artifacts.
+
+    Does not touch Qdrant -- callers drop the vector collection separately via
+    vector_store.drop(), since that's a network call rather than a local one.
+    """
+    for path in (partial_path(file_id), final_path(file_id)):
         path.unlink(missing_ok=True)

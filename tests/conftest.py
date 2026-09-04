@@ -1,11 +1,17 @@
 """Shared fixtures.
 
-Each test gets its own data directory, so uploads, indexes and the database
-never leak between tests. The config module is re-pointed before anything
-imports it, since paths are read at module load.
+Each test gets its own data directory, so uploads and the database never leak
+between tests. The config module is re-pointed before anything imports it,
+since paths are read at module load.
+
+Vector storage is a real Qdrant instance (QDRANT_URL, default localhost:6333 --
+see docker-compose.yml's `tests` service for the containerized run). Tests
+don't need to isolate collections from each other: every file gets a fresh
+uuid4 file_id, so collection names (file_<file_id>) never collide across
+tests or runs. Created collections are dropped at teardown for hygiene, not
+correctness.
 """
 
-import os
 import tempfile
 from pathlib import Path
 
@@ -18,11 +24,10 @@ def isolated_env(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
 
-        from app import config, db
+        from app import config, db, vector_store
 
         monkeypatch.setattr(config, "DATA_DIR", root)
         monkeypatch.setattr(config, "UPLOAD_DIR", root / "uploads")
-        monkeypatch.setattr(config, "INDEX_DIR", root / "indexes")
         monkeypatch.setattr(config, "DB_PATH", root / "metadata.db")
 
         # Small passages so tests produce several without large fixtures.
@@ -37,6 +42,25 @@ def isolated_env(monkeypatch):
         yield root
 
         db.close_connection()
+        _drop_test_collections()
+
+
+def _drop_test_collections() -> None:
+    """Best-effort cleanup of collections this test session created.
+
+    Not required for correctness -- every file_id is a fresh uuid4, so
+    collections never collide across tests -- but leaving hundreds of
+    empty-ish Qdrant collections around after a full test run is untidy.
+    """
+    from app import vector_store
+
+    try:
+        client = vector_store.get_client()
+        for name in client.get_collections().collections:
+            if name.name.startswith("file_"):
+                client.delete_collection(name.name)
+    except Exception:
+        pass  # Qdrant not reachable or already clean; not a test failure
 
 
 @pytest.fixture

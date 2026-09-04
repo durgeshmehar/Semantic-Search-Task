@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from . import config, db, search, upload
+from . import config, db, search, upload, vector_store
 from .pipeline import job_queue, worker
 
 logging.basicConfig(
@@ -24,6 +24,18 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     config.ensure_dirs()
     db.init_db()
+
+    # Fail fast on a misconfigured QDRANT_URL rather than only discovering it
+    # on the first upload's indexing attempt.
+    try:
+        vector_store.get_client().get_collections()
+        logger.info("connected to Qdrant at %s", config.QDRANT_URL)
+    except Exception:
+        logger.exception(
+            "could not reach Qdrant at %s -- is the qdrant service up?",
+            config.QDRANT_URL,
+        )
+        raise
 
     # Anything left mid-flight by an unclean shutdown goes back on the queue.
     recovered = job_queue.recover_stuck_jobs()
@@ -61,10 +73,17 @@ app.include_router(upload.router)
 app.include_router(search.router)
 
 
-@app.get("/health", tags=["meta"], summary="Liveness and worker state")
+@app.get("/health", tags=["meta"], summary="Liveness, worker, and Qdrant state")
 def health() -> dict:
+    try:
+        vector_store.get_client().get_collections()
+        qdrant_ok = True
+    except Exception:
+        qdrant_ok = False
+
     return {
-        "status": "ok",
+        "status": "ok" if qdrant_ok else "degraded",
         "workers_running": worker._pool.running if worker._pool else False,
         "queue_depth": job_queue.pending_count(),
+        "qdrant_reachable": qdrant_ok,
     }

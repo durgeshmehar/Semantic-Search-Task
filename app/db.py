@@ -53,7 +53,6 @@ CREATE TABLE IF NOT EXISTS chunks (
     end_byte        INTEGER NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending',
     retry_count     INTEGER NOT NULL DEFAULT 0,
-    vector_position INTEGER,
     error_message   TEXT,
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL
@@ -63,10 +62,8 @@ CREATE TABLE IF NOT EXISTS chunks (
 CREATE INDEX IF NOT EXISTS idx_chunks_queue
     ON chunks(status, file_id, sequence);
 
--- Search maps FAISS vector positions back to byte ranges.
-CREATE INDEX IF NOT EXISTS idx_chunks_vector
-    ON chunks(file_id, vector_position);
-
+-- Point IDs in Qdrant are derived from (file_id, sequence), so this is also
+-- the uniqueness the vector store relies on to make re-indexing idempotent.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_sequence
     ON chunks(file_id, sequence);
 """

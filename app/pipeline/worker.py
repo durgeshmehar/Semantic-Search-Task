@@ -12,7 +12,7 @@ more threads add memory without adding much throughput.
 import logging
 import threading
 
-from .. import config, db, faiss_index, storage
+from .. import config, db, storage, vector_store
 from . import embeddings, job_queue
 
 logger = logging.getLogger(__name__)
@@ -62,15 +62,24 @@ class IndexingWorker(threading.Thread):
 
             if empty:
                 # Nothing to index, but they mustn't stay queued forever.
-                job_queue.complete_batch(empty, [-1] * len(empty))
+                job_queue.complete_batch(empty)
 
             if not keep:
                 return True
 
             kept_jobs = [job for job, _ in keep]
             vectors = embeddings.embed_texts([text for _, text in keep])
-            positions = faiss_index.add_vectors(kept_jobs[0].file_id, vectors)
-            job_queue.complete_batch(kept_jobs, positions)
+            # Point IDs are derived from (file_id, sequence), so re-upserting
+            # this batch after a crash mid-way overwrites the same points
+            # rather than creating duplicates.
+            vector_store.add_vectors(
+                kept_jobs[0].file_id,
+                vectors,
+                sequences=[job.sequence for job in kept_jobs],
+                start_bytes=[job.start_byte for job in kept_jobs],
+                end_bytes=[job.end_byte for job in kept_jobs],
+            )
+            job_queue.complete_batch(kept_jobs)
 
         except Exception as exc:
             logger.exception("failed to index batch of %d chunks", len(jobs))

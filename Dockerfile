@@ -8,9 +8,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Torch pulls OpenMP; build tools are not needed since every wheel is prebuilt.
+# curl is only for the container HEALTHCHECK below; every Python wheel here
+# (including qdrant-client, a pure HTTP/gRPC client) is prebuilt.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 curl \
+    && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the CPU torch wheel explicitly. Without this, sentence-transformers
@@ -36,8 +37,9 @@ ENV HF_HUB_OFFLINE=1 \
 COPY app ./app
 COPY tests ./tests
 
-# Uploads, indexes and the database live here; mounted as a volume in compose
-# so they survive container restarts.
+# Uploads and the SQLite database live here; mounted as a volume in compose so
+# they survive container restarts. Vector storage lives in the separate Qdrant
+# service, not on this filesystem.
 RUN mkdir -p /app/data
 ENV DATA_DIR=/app/data
 

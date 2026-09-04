@@ -78,7 +78,7 @@ def test_complete_marks_indexed_and_advances_watermark(isolated_env):
     add_jobs(file_id, 3)
 
     jobs = job_queue.claim_batch()
-    job_queue.complete_batch(jobs, [0, 1, 2])
+    job_queue.complete_batch(jobs)
 
     conn = db.get_connection()
     row = conn.execute(
@@ -154,7 +154,7 @@ def test_processing_completes_only_after_upload_finishes(isolated_env):
     add_jobs(file_id, 2)
 
     jobs = job_queue.claim_batch()
-    job_queue.complete_batch(jobs, [0, 1])
+    job_queue.complete_batch(jobs)
 
     conn = db.get_connection()
     status = conn.execute(
@@ -169,7 +169,7 @@ def test_processing_completes_only_after_upload_finishes(isolated_env):
         )
     add_jobs(file_id, 1, start=2)
     jobs = job_queue.claim_batch()
-    job_queue.complete_batch(jobs, [2])
+    job_queue.complete_batch(jobs)
 
     status = conn.execute(
         "SELECT processing_status FROM files WHERE file_id = ?", (file_id,)

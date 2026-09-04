@@ -6,13 +6,16 @@ they share words. "database connectivity problems" scores highly against
 "Connection to database failed after 30 seconds" because the sentence
 embeddings are close, not because the terms overlap.
 
-Matching text is read back from the uploaded file by byte offset, since the
-chunk rows store coordinates rather than a duplicate copy of the corpus.
+Qdrant carries each passage's byte range as point payload, so a search result
+maps directly to a location in the uploaded file with no lookup back to
+SQLite -- the matching text itself is still read from the file by that byte
+range, since chunk rows (and now point payload) store coordinates rather than
+a duplicate copy of the corpus.
 """
 
 from fastapi import APIRouter, HTTPException, status
 
-from . import db, faiss_index, models, storage
+from . import db, models, storage, vector_store
 from .pipeline import embeddings
 
 router = APIRouter(tags=["search"])
@@ -47,48 +50,22 @@ def search_file(file_id: str, payload: models.SearchRequest) -> models.SearchRes
         )
 
     query_vector = embeddings.embed_query(payload.query)
-
-    # Over-fetch: some vector positions may belong to rows deleted or failed
-    # since indexing, and we still want a full page of results.
-    raw_hits = faiss_index.search(file_id, query_vector, payload.top_k * 2)
-    if not raw_hits:
-        return models.SearchResponse(
-            file_id=file_id, query=payload.query, total_hits=0, results=[]
-        )
-
-    positions = [position for position, _ in raw_hits]
-    scores = {position: score for position, score in raw_hits}
-
-    placeholders = ",".join("?" * len(positions))
-    rows = conn.execute(
-        f"""
-        SELECT sequence, start_byte, end_byte, vector_position
-          FROM chunks
-         WHERE file_id = ?
-           AND status = 'indexed'
-           AND vector_position IN ({placeholders})
-        """,
-        [file_id, *positions],
-    ).fetchall()
+    hits = vector_store.search(file_id, query_vector, payload.top_k)
 
     results = []
-    for row in rows:
-        text = storage.read_range(file_id, row["start_byte"], row["end_byte"])
+    for hit in hits:
+        text = storage.read_range(file_id, hit["start_byte"], hit["end_byte"])
         if not text.strip():
             continue
         results.append(
             models.SearchHit(
                 text=text,
-                start_byte=row["start_byte"],
-                end_byte=row["end_byte"],
-                score=scores.get(row["vector_position"], 0.0),
-                sequence=row["sequence"],
+                start_byte=hit["start_byte"],
+                end_byte=hit["end_byte"],
+                score=hit["score"],
+                sequence=hit["sequence"],
             )
         )
-
-    # SQL returned rows in table order; restore similarity order.
-    results.sort(key=lambda hit: hit.score, reverse=True)
-    results = results[: payload.top_k]
 
     return models.SearchResponse(
         file_id=file_id,

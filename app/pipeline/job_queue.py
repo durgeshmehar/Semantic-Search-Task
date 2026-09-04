@@ -151,8 +151,13 @@ def claim_batch(limit: int | None = None) -> list[ChunkJob]:
         ]
 
 
-def complete_batch(jobs: list[ChunkJob], vector_positions: list[int]) -> None:
-    """Mark jobs indexed and record where their vectors landed."""
+def complete_batch(jobs: list[ChunkJob]) -> None:
+    """Mark jobs indexed.
+
+    Byte ranges are looked up by (file_id, sequence) rather than a stored
+    vector position: Qdrant carries start_byte/end_byte as point payload, so a
+    search result maps directly to a byte range without a join back here.
+    """
     if not jobs:
         return
 
@@ -161,13 +166,10 @@ def complete_batch(jobs: list[ChunkJob], vector_positions: list[int]) -> None:
         conn.executemany(
             """
             UPDATE chunks
-               SET status = 'indexed', vector_position = ?, updated_at = ?
+               SET status = 'indexed', updated_at = ?
              WHERE chunk_id = ?
             """,
-            [
-                (position, now, job.chunk_id)
-                for job, position in zip(jobs, vector_positions)
-            ],
+            [(now, job.chunk_id) for job in jobs],
         )
 
         file_id = jobs[0].file_id

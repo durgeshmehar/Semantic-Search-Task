@@ -13,7 +13,7 @@ import uuid
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 
-from . import config, db, faiss_index, models, storage
+from . import config, db, models, storage, vector_store
 from .pipeline import job_queue
 from .pipeline.line_buffer import LineBuffer
 
@@ -248,4 +248,4 @@ def delete_file(file_id: str) -> None:
         conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
         conn.execute("DELETE FROM files WHERE file_id = ?", (file_id,))
     storage.delete_all(file_id)
-    faiss_index.drop(file_id)
+    vector_store.drop(file_id)

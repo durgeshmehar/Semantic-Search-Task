@@ -11,16 +11,20 @@ seconds.` even though they share one word.
 
 ## Setup
 
-Everything runs in Docker; nothing needs installing locally.
+Everything runs in Docker; nothing needs installing locally. `docker compose up` starts two
+services — the API and a Qdrant instance for vector storage — and waits for Qdrant to report
+healthy before starting the API.
 
 ```bash
-docker compose up --build      # API on :8000, docs at /docs
-docker compose --profile test run --rm tests    # 50 tests
+docker compose up --build      # API on :8000, docs at /docs; Qdrant on :6333
+docker compose --profile test run --rm tests    # 50 tests, against a real Qdrant
 ```
 
-Without Docker:
+Without Docker, a local Qdrant is still required (there is no in-process fallback):
 
 ```bash
+docker run -p 6333:6333 qdrant/qdrant:v1.12.1
+
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app
@@ -59,7 +63,7 @@ Interactive documentation: **`/docs`** (OpenAPI, generated from the code).
 | `POST` | `/files/{file_id}/search` | Natural-language search |
 | `GET` | `/files` | List uploads |
 | `DELETE` | `/files/{file_id}` | Delete a file and its index |
-| `GET` | `/health` | Liveness, workers, queue depth |
+| `GET` | `/health` | Liveness, workers, queue depth, Qdrant connectivity |
 
 **`POST /files`** — `{"filename": "server.log", "total_size": 10485760}`
 → `{"file_id": "a3f...", "chunk_size": 16777216, "upload_status": "pending"}`
@@ -110,31 +114,36 @@ store. Chunk rows hold `(file_id, start_byte, end_byte)` — 24 bytes rather tha
 text. Copying text into SQLite would write the corpus twice and put that cost on the upload's
 critical path. Search `seek()`s to the offsets of its ~10 results.
 
-**Quantized index.** Vectors are stored int8 (384 B) rather than float32 (1,536 B) via scalar
-quantization (`IndexScalarQuantizer`) — each of the 384 numbers rounded independently to one byte.
-4× smaller, ~2–3% recall cost. This is the only compression applied; search is still exhaustive
-(every query compares against every vector in the file), and the index is fully loaded into memory
-on each search rather than genuinely memory-mapped — FAISS's `IO_FLAG_MMAP` only takes effect for
-`IndexIVF` variants with an on-disk layout, which this project doesn't use. See §6 for what a real
-approximate-search index would add.
+**Vector storage is Qdrant, disk-backed with quantized vectors kept resident.** Each file gets its
+own collection (`file_<file_id>`), configured with `on_disk: true` for raw vectors and the HNSW
+graph, and int8 scalar quantization (`always_ram: true` for the quantized copy only — see
+[app/vector_store.py](app/vector_store.py)). A vector costs 384 B quantized versus 1,536 B at
+float32 — 4× smaller, ~2–3% recall cost — and only that quantized copy needs to be resident; raw
+vectors and the graph structure are read from disk as a search touches them. This is a real,
+verified property, not an assumption: `curl localhost:6333/collections/<name>` on a live collection
+confirms `on_disk: true` and the quantization config are actually in effect, not merely requested.
+Search itself is approximate (HNSW — a graph search that visits a small neighborhood rather than
+every vector), not the exhaustive brute-force comparison a naive per-file index would do.
 
-**Passage size scales with file size.** This is the real tension. Small passages embed precisely —
-one relevant line is a large share of the passage, so it survives being averaged into a single
-vector. But small passages mean *more* vectors: a 10 GB file at the 600 B default would produce
-~22M vectors, 8 GB even at int8. So `config.passage_size_for()` scales the target to keep each
-index within 1 GB:
+**Passage size scales with file size.** This is the real tension, independent of the storage
+engine. Small passages embed precisely — one relevant line is a large share of the passage, so it
+survives being averaged into a single vector. But small passages mean *more* vectors: a 10 GB file
+at the 600 B default would produce ~22M vectors, ~8.4 GB even quantized. So
+`config.passage_size_for()` scales the target to keep each file's resident (quantized) footprint
+within 1 GB:
 
-| File size | Passage target | Vectors | Index RAM |
+| File size | Passage target | Vectors | Resident quantized |
 |---|---|---|---|
 | 100 MB | 600 B | 218 K | 0.08 GB |
 | 1 GB | 600 B | 2.2 M | 0.80 GB |
 | 10 GB | 4,800 B | 2.8 M | 1.00 GB |
 
 Typical uploads keep the precise default; only huge files coarsen, and recall softens on them as a
-result. §6 describes what removes that tradeoff at scale.
+result.
 
-**Peak memory (10 GB file):** ~640 MB Python/torch/model + ~1.0 GB index + ~300 MB workers +
-~170 MB uploads + ~100 MB SQLite ≈ **2.2 GB**.
+**Peak memory (10 GB file):** ~640 MB Python/torch/model (API container) + ~300 MB workers +
+~170 MB uploads + ~100 MB SQLite + ~1.0 GB resident quantized vectors (Qdrant, its own container
+and memory limit) ≈ **~2.2 GB total**, split across two containers rather than one process.
 
 ### 2. Interrupted uploads
 
@@ -154,8 +163,8 @@ continues from there.
 
 ### 3. Multiple concurrent uploads
 
-Each upload is independent: its own `.partial` file, line-buffer state, and FAISS index. Nothing is
-shared on the write path.
+Each upload is independent: its own `.partial` file, line-buffer state, and Qdrant collection.
+Nothing is shared on the write path.
 
 A **fixed worker pool** (2 by default) caps concurrent embedding regardless of uploads in flight,
 and **SQLite in WAL mode** lets the upload path write while workers read, so indexing never blocks
@@ -182,15 +191,25 @@ indexed | failed`). Workers claim rows atomically inside an `IMMEDIATE` transact
 never embed the same passage. On startup, rows stranded in `processing` by a crash reset to
 `pending`. A failing passage retries, then is marked `failed` without blocking the file.
 
+**Re-indexing a passage is safe by construction, not just by queue discipline.** Each passage's
+Qdrant point ID is derived deterministically from `(file_id, sequence)` (a uuid5), so if a worker
+crashes mid-batch and the same passage is claimed and embedded again after restart, the second
+upsert overwrites the same point rather than creating a duplicate. This means point uniqueness
+doesn't depend solely on the job queue never double-claiming a row — it holds even if that
+invariant were ever violated.
+
 ### 5. How semantic search works
 
 Passages are embedded with `all-MiniLM-L6-v2` into 384-dimensional vectors. The model maps text to
 a space where *meaning* determines position, so passages about the same thing land near each other
-regardless of wording. Vectors are L2-normalised, making cosine similarity an inner product — so
-FAISS's `IndexFlatIP` computes semantic similarity directly.
+regardless of wording. The Qdrant collection is configured for cosine distance directly, so no
+manual normalization step is needed on our side.
 
-A query goes through the same model; FAISS returns nearest vector positions, which map back to byte
-ranges via the `chunks` table, and the text is read from the file.
+A query goes through the same model; Qdrant's `query_points` returns the nearest passages by
+approximate (HNSW) similarity search, each carrying its byte range and sequence number as payload —
+so a hit maps straight to a location in the file with no separate lookup table. The matching text
+itself is then read from the uploaded file at that byte range (`app/storage.py`), since the corpus
+isn't duplicated into Qdrant's payload or SQLite.
 
 Why the example works: `database connectivity problems` and `Connection to database failed after 30
 seconds` share only "database", so keyword search ranks it poorly. Both describe a database
@@ -216,21 +235,22 @@ processes instead of two threads.
 **Local disk storage** → S3 multipart upload (which also provides resumability natively), making
 API nodes stateless and horizontally scalable behind a load balancer.
 
-**Per-file FAISS indexes** → a managed vector DB (Qdrant, Milvus) that shards and replicates, so
-search scales independently of upload.
+**Per-file Qdrant collections** → a clustered Qdrant deployment (or a managed vector DB) with
+sharding and replication, so search scales independently of upload and survives a node failure. One
+collection per file is simple and gives clean isolation at this scale, but thousands of files means
+thousands of small collections, which has its own overhead — a single collection with a `file_id`
+payload filter would likely be the better trade past a certain file count.
 
-**Exhaustive search itself.** This project's index (`IndexFlatIP` / `IndexScalarQuantizer`)
-compares a query against every stored vector — no bucketing, no approximation. That's fine at a few
-million vectors per file but doesn't scale to tens of millions across many files searched
-concurrently. The standard fix is **`IndexIVFPQ`**: IVF (inverted file) clusters vectors into
-~√n buckets so a query only scans the nearest few (the bucketing idea behind LSH-style approaches),
-and PQ (Product Quantization) compresses each vector into a handful of codebook indices — 16–64×
-smaller than scalar quantization's flat 4×, versus scanning ~30K vectors instead of millions. It
-wasn't used here because IVF/PQ both require training on a representative sample before vectors can
-be added, which conflicts with this project's streaming design (passages are indexed continuously
-as bytes arrive, before the full distribution is known). At scale, the fix is to buffer flat until
-enough vectors exist, train IVF+PQ on that sample, then convert — combined with a real memory-mapped
-on-disk layout (`OnDiskInvertedLists`), which is what FAISS's mmap support actually requires.
+**Approximate search was chosen up front here, not deferred to a later migration.** An earlier
+version of this project used FAISS with an exhaustive flat index, because FAISS's approximate
+option (`IndexIVFPQ`) requires training on a representative vector sample before anything can be
+inserted — which conflicts with indexing continuously as an upload streams in. Qdrant's default
+index, HNSW, is a graph built incrementally with no training phase, so it fits that streaming
+pattern natively; this is the actual reason for using Qdrant rather than FAISS directly, not just
+"a vector database is more scalable." At the scale this section is about — many files, each with
+tens of millions of vectors, searched concurrently — the next lever is `hnsw_config.m` and
+`ef_construct` tuning (graph connectivity vs. build cost) and, past that, product quantization on
+top of the current scalar quantization for additional compression.
 
 **Embedding volume as the dominant cost.** Two-stage retrieval cuts it ~95%: embed coarse ~50 KB
 sections to find candidate regions, then embed finely only within candidates for reranking. A
@@ -242,6 +262,7 @@ what embeddings are weak at — exact identifiers like error codes and UUIDs.
 ## Architecture
 
 ```
+                        API container                              Qdrant container
 Client ──PUT chunk?offset=N──►  Upload handler          (cheap, bounded)
                                  1. append → {id}.partial
                                  2. split lines → passages
@@ -250,31 +271,34 @@ Client ──PUT chunk?offset=N──►  Upload handler          (cheap, bounde
                                           │
                                           ▼  chunks table = durable queue
                                 Worker pool               (expensive)
-                                 claim → read range → embed →
-                                 append to FAISS → mark indexed
+                                 claim → read range → embed
+                                 → upsert (uuid5 point id) ───────►  HNSW index, on-disk vectors,
+                                 → mark indexed                      int8 quantized (resident)
 
-Search:  query → embed → FAISS top-k → byte ranges → seek() file → text
+Search:  query → embed → ───────────────────────────────────►  approximate top-k
+                                                                 (byte range + score in payload)
+                          ◄─── byte ranges ── seek() file → text
 ```
 
 | Module | Responsibility |
 |---|---|
 | [app/upload.py](app/upload.py) | Chunked upload, offset validation, status |
-| [app/search.py](app/search.py) | Query embedding, FAISS lookup, byte-range reads |
+| [app/search.py](app/search.py) | Query embedding, Qdrant lookup, byte-range reads |
 | [app/pipeline/line_buffer.py](app/pipeline/line_buffer.py) | Bytes → line-aligned passage ranges |
 | [app/pipeline/job_queue.py](app/pipeline/job_queue.py) | Durable queue: claim/complete/fail/recover |
 | [app/pipeline/worker.py](app/pipeline/worker.py) | Background embedding threads |
-| [app/faiss_index.py](app/faiss_index.py) | Per-file index, scalar quantization |
+| [app/vector_store.py](app/vector_store.py) | Per-file Qdrant collection, idempotent upserts, search |
 | [app/storage.py](app/storage.py) | On-disk layout, atomic finalize, range reads |
 
 Configuration is environment-driven — see [app/config.py](app/config.py) (`WORKER_COUNT`,
-`PASSAGE_TARGET_BYTES`, `MAX_CHUNK_BYTES`, `USE_QUANTIZATION`, …).
+`PASSAGE_TARGET_BYTES`, `MAX_CHUNK_BYTES`, `QDRANT_URL`, `QUANTIZATION_ALWAYS_RAM`, …).
 
 ---
 
 ## Testing
 
 ```bash
-docker compose --profile test run --rm tests      # 50 passed
+docker compose --profile test run --rm tests      # 50 passed, against a real Qdrant
 ```
 
 - **`test_line_buffer.py`** — passages tile the input losslessly however the stream is split;
@@ -282,18 +306,19 @@ docker compose --profile test run --rm tests      # 50 passed
 - **`test_upload.py`** — chunked upload, interruption, resume, byte-exact reassembly, offset
   rejection.
 - **`test_job_queue.py`** — exclusive claiming, retry-then-fail, crash recovery.
-- **`test_config.py`** — a 10 GB file's index stays within the memory budget.
+- **`test_config.py`** — a 10 GB file's resident quantized-vector footprint stays within budget.
 - **`test_search.py`** — the assignment's example end to end, ranking, byte offsets, search during
-  upload, Unicode.
+  upload, Unicode. Runs against the real embedding model and a real Qdrant collection, not mocks.
 
-Also verified by hand against the running container:
+Also verified by hand against the running two-container stack:
 
 | Check | Result |
 |---|---|
 | Interrupted upload → resume | file md5-identical to the original |
-| `docker kill` mid-upload → restart → resume | progress preserved, md5 matches |
+| `docker kill` on the API container mid-upload → restart → resume | progress preserved (Qdrant, a separate container, was unaffected); md5 matches |
 | Wrong / replayed offset | `409` with resume offset, file uncorrupted |
 | Indexing during upload | 37 passages searchable at 33% uploaded |
+| Qdrant collection config, inspected directly via `curl localhost:6333/collections/<name>` | `on_disk: true` for vectors and HNSW, int8 scalar quantization all confirmed actually applied, not just requested |
 | `"running out of storage space"` | → `"No space left on device"` (0.611, no shared words) |
 | `"wrong password entered"` | → `"Failed login attempt … bad password"` (0.482) |
 
@@ -303,8 +328,12 @@ Also verified by hand against the running container:
 
 Deliberate scope choices, given the 4 GB target and the "not production-ready" note:
 
-- **One API process** — the worker pool is in-process, so multiple uvicorn workers would each start
-  their own. Scaling out means the changes in §6.
+- **One API process** — the worker pool is in-process (separate from Qdrant, which now runs in its
+  own container), so multiple uvicorn workers would each start their own pool. Scaling out means
+  the changes in §6.
+- **One Qdrant collection per file** — clean isolation and simple deletion at this scale, but
+  thousands of files means thousands of small collections; a single collection with a `file_id`
+  payload filter would be the better trade at that point.
 - **Text files only**; no PDF/DOCX extraction.
 - **No authentication** — any client can read any `file_id`.
 - **Indexing lags on very large files** — a 10 GB upload finishes indexing minutes after the last
@@ -324,16 +353,30 @@ How the output was validated and corrected:
   int8 scalar quantization into the design. Later, shrinking passages for search quality pushed a
   10 GB file to ~22M vectors (8 GB), which is what motivated `config.passage_size_for()`.
 - **A memory-mapping claim was asserted without checking FAISS's actual support matrix, and was
-  wrong.** The code called `read_index(path, faiss.IO_FLAG_MMAP)` and the README claimed the
-  resident set was "bounded by what searches touch." In fact `IO_FLAG_MMAP` only takes effect for
-  `IndexIVF` variants backed by `OnDiskInvertedLists`; for the flat/scalar-quantized indexes used
-  here, FAISS loads the whole file into memory regardless of the flag — and `search()` re-read the
-  index from disk on every call regardless. Caught when asked directly whether LSH, Product
-  Quantization, and mmap were actually in use, rather than by the test suite. The flag has been
-  removed from the code and the README now states plainly what is and isn't implemented: scalar
-  quantization only (not PQ), exhaustive flat search (not IVF/LSH-style bucketing), no real
-  memory-mapping — see §6 for what `IndexIVFPQ` would add and why it wasn't built given the
-  streaming design.
+  wrong — this is what led to migrating off FAISS entirely.** The code called
+  `read_index(path, faiss.IO_FLAG_MMAP)` and the README claimed the resident set was "bounded by
+  what searches touch." In fact `IO_FLAG_MMAP` only takes effect for `IndexIVF` variants backed by
+  `OnDiskInvertedLists`; for the flat/scalar-quantized indexes used at the time, FAISS loaded the
+  whole file into memory regardless of the flag, and `search()` re-read the index from disk on
+  every call regardless. Caught when asked directly whether LSH, Product Quantization, and mmap
+  were actually in use, rather than by the test suite.
+
+  Getting a real version of that property in FAISS means `IndexIVFPQ`, and IVF/PQ both require
+  training on a representative vector sample before anything can be inserted — which conflicts with
+  this project's streaming design (passages are indexed continuously as bytes arrive, before the
+  full distribution is known). Rather than build a buffer-then-train-then-convert workaround, the
+  project migrated the vector store to **Qdrant**, whose default index (HNSW) is built
+  incrementally with no training phase, so it fits the existing streaming pipeline without changing
+  it. On-disk storage and int8 scalar quantization then became collection configuration
+  (`app/vector_store.py`) rather than index-management code to write and validate. This was
+  verified, not assumed: `curl localhost:6333/collections/<name>` on a live collection during
+  manual testing confirmed `on_disk: true` and the quantization config were actually in effect.
+
+  The migration also picked up two smaller improvements the earlier design didn't have: point IDs
+  are now derived deterministically from `(file_id, sequence)`, so re-embedding a passage after a
+  worker crash safely overwrites the same point instead of relying solely on the job queue to
+  prevent duplication; and searches no longer join back to SQLite to map a hit to a byte range,
+  since Qdrant carries `start_byte`/`end_byte` as point payload directly.
 - **An early design used BM25/FTS5 as the primary retrieval path** with embeddings as a reranker.
   Rejected on review: the spec asks for matching "based on meaning rather than exact keyword
   matches", and keyword-first retrieval contradicts that regardless of benchmark performance.
