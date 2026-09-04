@@ -3,13 +3,24 @@
 One index per file, because searches are always scoped to a single file and
 per-file indexes keep uploads independent of each other.
 
-Memory is the constraint that shapes this module. A 10 GB text file yields
-roughly 1.1M passages; at float32 that is 1.1M x 384 x 4 B = ~1.7 GB, which
-does not fit alongside the model and the rest of the service in 4 GB. Stored as
-int8 the same index is ~420 MB, and reading it back memory-mapped means the
-resident set is bounded by what searches actually touch rather than by the
-index size. The cost is roughly 2-3% recall, which does not change which
-sections come back for a natural-language query.
+Memory is the constraint that shapes this module. At float32, one vector per
+passage costs 384 x 4 B = 1,536 B; stored as int8 (scalar quantization) the
+same vector is 384 B, a straight 4x reduction with ~2-3% recall cost. Combined
+with adaptive passage sizing (config.passage_size_for) this keeps a 10 GB
+file's index within a fixed RAM budget -- see README section 1 for the sizing
+table.
+
+What this module does NOT do, worth being explicit about: search is exhaustive
+(IndexFlat / IndexScalarQuantizer compare the query against every vector, no
+bucketing or approximate search), so there is no LSH- or IVF-style partitioning
+and no Product Quantization (which compresses in sub-vector groups against a
+trained codebook, typically 16-64x, versus the flat 4x scalar quantization used
+here). The index is also not genuinely memory-mapped: FAISS's IO_FLAG_MMAP only
+takes effect for IndexIVF variants backed by OnDiskInvertedLists, so this
+project reads the whole index into memory on every search. Getting real
+bucketed, on-disk search would mean training an IndexIVFPQ once enough vectors
+exist and converting to it -- a genuine engineering addition, not a flag change
+-- which is out of scope here but is the natural next step at larger scale.
 
 Small files skip quantization entirely -- a scalar quantizer needs training
 data, and below a few thousand vectors a flat index is both simpler and
@@ -89,10 +100,14 @@ def search(file_id: str, query_vector: np.ndarray, top_k: int) -> list[tuple[int
         return []
 
     with _lock_for(file_id):
-        # Memory-map rather than loading: for a large index only the pages a
-        # search touches are faulted in, and the OS can evict them under
-        # pressure. This is what keeps a 420 MB index off the heap.
-        index = faiss.read_index(str(path), faiss.IO_FLAG_MMAP)
+        # NOTE: IO_FLAG_MMAP is not used here. It only takes effect for
+        # IndexIVF variants backed by OnDiskInvertedLists; for the flat and
+        # scalar-quantized indexes used in this project, FAISS loads the file
+        # into memory regardless of the flag. Passing it anyway would be
+        # misleading -- see README §1 for what actually bounds memory here
+        # (int8 quantization + adaptive passage sizing) and what a real
+        # on-disk ANN index (IndexIVFPQ) would add.
+        index = faiss.read_index(str(path))
         if index.ntotal == 0:
             return []
 

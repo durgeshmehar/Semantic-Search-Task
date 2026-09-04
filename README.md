@@ -110,9 +110,13 @@ store. Chunk rows hold `(file_id, start_byte, end_byte)` — 24 bytes rather tha
 text. Copying text into SQLite would write the corpus twice and put that cost on the upload's
 critical path. Search `seek()`s to the offsets of its ~10 results.
 
-**Quantized, memory-mapped index.** Vectors are stored int8 (384 B) rather than float32 (1,536 B)
-and read with `IO_FLAG_MMAP`, so the resident set is bounded by what searches touch. Costs ~2–3%
-recall.
+**Quantized index.** Vectors are stored int8 (384 B) rather than float32 (1,536 B) via scalar
+quantization (`IndexScalarQuantizer`) — each of the 384 numbers rounded independently to one byte.
+4× smaller, ~2–3% recall cost. This is the only compression applied; search is still exhaustive
+(every query compares against every vector in the file), and the index is fully loaded into memory
+on each search rather than genuinely memory-mapped — FAISS's `IO_FLAG_MMAP` only takes effect for
+`IndexIVF` variants with an on-disk layout, which this project doesn't use. See §6 for what a real
+approximate-search index would add.
 
 **Passage size scales with file size.** This is the real tension. Small passages embed precisely —
 one relevant line is a large share of the passage, so it survives being averaged into a single
@@ -215,6 +219,19 @@ API nodes stateless and horizontally scalable behind a load balancer.
 **Per-file FAISS indexes** → a managed vector DB (Qdrant, Milvus) that shards and replicates, so
 search scales independently of upload.
 
+**Exhaustive search itself.** This project's index (`IndexFlatIP` / `IndexScalarQuantizer`)
+compares a query against every stored vector — no bucketing, no approximation. That's fine at a few
+million vectors per file but doesn't scale to tens of millions across many files searched
+concurrently. The standard fix is **`IndexIVFPQ`**: IVF (inverted file) clusters vectors into
+~√n buckets so a query only scans the nearest few (the bucketing idea behind LSH-style approaches),
+and PQ (Product Quantization) compresses each vector into a handful of codebook indices — 16–64×
+smaller than scalar quantization's flat 4×, versus scanning ~30K vectors instead of millions. It
+wasn't used here because IVF/PQ both require training on a representative sample before vectors can
+be added, which conflicts with this project's streaming design (passages are indexed continuously
+as bytes arrive, before the full distribution is known). At scale, the fix is to buffer flat until
+enough vectors exist, train IVF+PQ on that sample, then convert — combined with a real memory-mapped
+on-disk layout (`OnDiskInvertedLists`), which is what FAISS's mmap support actually requires.
+
 **Embedding volume as the dominant cost.** Two-stage retrieval cuts it ~95%: embed coarse ~50 KB
 sections to find candidate regions, then embed finely only within candidates for reranking. A
 keyword index (FTS5, Elasticsearch) as a first-pass filter serves the same purpose and also covers
@@ -246,7 +263,7 @@ Search:  query → embed → FAISS top-k → byte ranges → seek() file → tex
 | [app/pipeline/line_buffer.py](app/pipeline/line_buffer.py) | Bytes → line-aligned passage ranges |
 | [app/pipeline/job_queue.py](app/pipeline/job_queue.py) | Durable queue: claim/complete/fail/recover |
 | [app/pipeline/worker.py](app/pipeline/worker.py) | Background embedding threads |
-| [app/faiss_index.py](app/faiss_index.py) | Per-file index, quantization, mmap |
+| [app/faiss_index.py](app/faiss_index.py) | Per-file index, scalar quantization |
 | [app/storage.py](app/storage.py) | On-disk layout, atomic finalize, range reads |
 
 Configuration is environment-driven — see [app/config.py](app/config.py) (`WORKER_COUNT`,
@@ -304,8 +321,19 @@ How the output was validated and corrected:
 
 - **The memory budget was wrong twice, and arithmetic caught it.** An early draft claimed a 10 GB
   file's index would be "a few hundred MB"; working it through gave ~1.7 GB — ~100× off. That drove
-  int8 quantization and mmap into the design. Later, shrinking passages for search quality pushed a
+  int8 scalar quantization into the design. Later, shrinking passages for search quality pushed a
   10 GB file to ~22M vectors (8 GB), which is what motivated `config.passage_size_for()`.
+- **A memory-mapping claim was asserted without checking FAISS's actual support matrix, and was
+  wrong.** The code called `read_index(path, faiss.IO_FLAG_MMAP)` and the README claimed the
+  resident set was "bounded by what searches touch." In fact `IO_FLAG_MMAP` only takes effect for
+  `IndexIVF` variants backed by `OnDiskInvertedLists`; for the flat/scalar-quantized indexes used
+  here, FAISS loads the whole file into memory regardless of the flag — and `search()` re-read the
+  index from disk on every call regardless. Caught when asked directly whether LSH, Product
+  Quantization, and mmap were actually in use, rather than by the test suite. The flag has been
+  removed from the code and the README now states plainly what is and isn't implemented: scalar
+  quantization only (not PQ), exhaustive flat search (not IVF/LSH-style bucketing), no real
+  memory-mapping — see §6 for what `IndexIVFPQ` would add and why it wasn't built given the
+  streaming design.
 - **An early design used BM25/FTS5 as the primary retrieval path** with embeddings as a reranker.
   Rejected on review: the spec asks for matching "based on meaning rather than exact keyword
   matches", and keyword-first retrieval contradicts that regardless of benchmark performance.
