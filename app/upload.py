@@ -160,6 +160,17 @@ async def upload_chunk(
     holding up to MAX_CHUNK_BYTES -- the failure mode without a cap is a
     memory spike big enough to have the whole container OOM-killed, taking
     every in-flight request down with it, not just the excess uploads.
+
+    The body is read via the raw Request rather than a typed `Body(...)`
+    parameter deliberately: FastAPI 0.115's request-body dispatch still
+    attempts to JSON-decode a scalar `bytes = Body(media_type=...)` parameter
+    before honoring its declared media type, so it 422s on real clients whose
+    default Content-Type isn't exactly what FastAPI expects (curl's
+    --data-binary defaults to application/x-www-form-urlencoded; httpx sends
+    none) -- i.e. it fails on the very clients this endpoint has to accept
+    bytes from. Reading the raw body sidesteps that dispatch entirely; the
+    OpenAPI schema for this endpoint is filled in by hand in app/main.py
+    instead, so Swagger's "Try it out" still shows a working upload field.
     """
     try:
         with upload_limiter.acquire():
