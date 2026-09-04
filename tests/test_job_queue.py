@@ -18,9 +18,9 @@ def make_file(file_id: str = "f1", total_size: int = 1000, completed: bool = Fal
         conn.execute(
             """
             INSERT INTO files
-                (file_id, filename, total_size, bytes_received, upload_status,
-                 processing_status, created_at, updated_at)
-            VALUES (?, 'test.log', ?, ?, ?, 'pending', ?, ?)
+                (file_id, owner_id, filename, total_size, bytes_received,
+                 upload_status, processing_status, created_at, updated_at)
+            VALUES (?, 'test-owner', 'test.log', ?, ?, ?, 'pending', ?, ?)
             """,
             (
                 file_id,
@@ -146,6 +146,25 @@ def test_recover_marks_live_uploads_interrupted(isolated_env):
     ).fetchone()
     # The client needs to know to ask for a resume offset.
     assert row["upload_status"] == "interrupted"
+
+
+def test_recover_resets_a_crash_mid_finalize_back_to_uploading(isolated_env):
+    """A crash between marking 'finalizing' and completing the rename must be
+    recoverable -- the client's next /complete call picks up where it left off."""
+    file_id = make_file()
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE files SET upload_status = 'finalizing' WHERE file_id = ?",
+            (file_id,),
+        )
+
+    job_queue.recover_stuck_jobs()
+
+    conn = db.get_connection()
+    row = conn.execute(
+        "SELECT upload_status FROM files WHERE file_id = ?", (file_id,)
+    ).fetchone()
+    assert row["upload_status"] == "uploading"
 
 
 def test_processing_completes_only_after_upload_finishes(isolated_env):

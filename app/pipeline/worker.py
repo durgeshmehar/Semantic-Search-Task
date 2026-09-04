@@ -55,10 +55,14 @@ class IndexingWorker(threading.Thread):
                 for job in jobs
             ]
 
-            # A passage can read back empty if the file was deleted mid-flight.
-            # Embedding empty strings pollutes the index, so drop them.
-            keep = [(job, text) for job, text in zip(jobs, texts) if text.strip()]
-            empty = [job for job, text in zip(jobs, texts) if not text.strip()]
+            # A truly empty read (file missing, or the range came back with
+            # zero bytes) means the file was deleted mid-flight or the range
+            # is bogus -- nothing to embed. This is deliberately narrower than
+            # "falsy after strip()": a passage of blank lines between log
+            # entries is legitimate content whose absence from search results
+            # would be a silent, hard-to-notice gap, not a crash.
+            keep = [(job, text) for job, text in zip(jobs, texts) if text]
+            empty = [job for job, text in zip(jobs, texts) if not text]
 
             if empty:
                 # Nothing to index, but they mustn't stay queued forever.

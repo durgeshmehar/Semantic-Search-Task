@@ -25,6 +25,11 @@ _local = threading.local()
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
     file_id            TEXT PRIMARY KEY,
+    -- Client-supplied via X-User-Id (see app/identity.py). Not authenticated --
+    -- there is no login -- but it scopes listing/search/delete so one user
+    -- can't act on another's files, and it is what a real auth layer would
+    -- slot into later without changing this schema.
+    owner_id           TEXT NOT NULL,
     filename           TEXT NOT NULL,
     total_size         INTEGER NOT NULL,
     bytes_received     INTEGER NOT NULL DEFAULT 0,
@@ -61,6 +66,10 @@ CREATE TABLE IF NOT EXISTS chunks (
 -- The queue's hot path: "give me the oldest pending work".
 CREATE INDEX IF NOT EXISTS idx_chunks_queue
     ON chunks(status, file_id, sequence);
+
+-- GET /files scopes its listing to the caller.
+CREATE INDEX IF NOT EXISTS idx_files_owner
+    ON files(owner_id, created_at);
 
 -- Point IDs in Qdrant are derived from (file_id, sequence), so this is also
 -- the uniqueness the vector store relies on to make re-indexing idempotent.

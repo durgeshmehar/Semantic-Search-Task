@@ -13,9 +13,10 @@ range, since chunk rows (and now point payload) store coordinates rather than
 a duplicate copy of the corpus.
 """
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from . import db, models, storage, vector_store
+from .identity import get_user_id
 from .pipeline import embeddings
 
 router = APIRouter(tags=["search"])
@@ -30,7 +31,11 @@ router = APIRouter(tags=["search"])
         409: {"model": models.ErrorResponse, "description": "Nothing indexed yet"},
     },
 )
-def search_file(file_id: str, payload: models.SearchRequest) -> models.SearchResponse:
+def search_file(
+    file_id: str,
+    payload: models.SearchRequest,
+    user_id: str = Depends(get_user_id),
+) -> models.SearchResponse:
     """Return the sections whose meaning is closest to the query.
 
     Searching is allowed while the upload is still in progress -- whatever has
@@ -38,9 +43,10 @@ def search_file(file_id: str, payload: models.SearchRequest) -> models.SearchRes
     """
     conn = db.get_connection()
     file_row = conn.execute(
-        "SELECT file_id, chunks_indexed FROM files WHERE file_id = ?", (file_id,)
+        "SELECT file_id, owner_id, chunks_indexed FROM files WHERE file_id = ?",
+        (file_id,),
     ).fetchone()
-    if file_row is None:
+    if file_row is None or file_row["owner_id"] != user_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown file_id: {file_id}")
 
     if file_row["chunks_indexed"] == 0:
@@ -55,7 +61,10 @@ def search_file(file_id: str, payload: models.SearchRequest) -> models.SearchRes
     results = []
     for hit in hits:
         text = storage.read_range(file_id, hit["start_byte"], hit["end_byte"])
-        if not text.strip():
+        if not text:
+            # A genuinely empty read only happens if the file's gone; a
+            # whitespace-only passage is legitimate content and must not be
+            # dropped from results just because it strips to nothing.
             continue
         results.append(
             models.SearchHit(

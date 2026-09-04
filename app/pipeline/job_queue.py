@@ -271,7 +271,18 @@ def _refresh_processing_status(conn, file_id: str, now: float) -> None:
 
 
 def recover_stuck_jobs() -> int:
-    """Reset rows abandoned mid-flight by a crash. Called on startup."""
+    """Reset rows and files abandoned mid-flight by a crash. Called on startup.
+
+    Safe to run unconditionally here specifically because it runs during
+    FastAPI's lifespan startup, before the server accepts any connections (see
+    app/main.py) -- so "upload_status = 'uploading'" at this exact moment
+    cannot mean a live client is mid-request, only that the previous process
+    died holding that state. That precondition would not hold if this were
+    ever called from a live request path or a multi-replica deployment sharing
+    this database; at that scale, ownership of "is this upload actually still
+    active" needs a heartbeat or lease rather than inference from a status
+    string (see README section 6).
+    """
     now = time.time()
     with db.transaction() as conn:
         cursor = conn.execute(
@@ -291,6 +302,21 @@ def recover_stuck_jobs() -> int:
             UPDATE files
                SET upload_status = 'interrupted', updated_at = ?
              WHERE upload_status = 'uploading'
+            """,
+            (now,),
+        )
+
+        # A crash between marking 'finalizing' and completing the rename
+        # leaves the file mid-way through POST /complete. Since chunk PUTs
+        # already refuse a 'finalizing' file, the only way forward is to
+        # finish what complete() was doing, so put it back in 'uploading' and
+        # let the client call /complete again -- it's idempotent past the
+        # rename (storage.finalize() is a no-op if .dat already exists).
+        conn.execute(
+            """
+            UPDATE files
+               SET upload_status = 'uploading', updated_at = ?
+             WHERE upload_status = 'finalizing'
             """,
             (now,),
         )

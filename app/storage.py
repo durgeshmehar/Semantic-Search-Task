@@ -93,14 +93,29 @@ def read_range(file_id: str, start: int, end: int) -> str:
 
     A range may begin or end mid-character when it came from a long-line split,
     so decoding replaces malformed bytes rather than raising.
+
+    `readable_path` picks .dat or .partial by checking which exists, but
+    finalize() can rename .partial to .dat between that check and this open()
+    -- a real, if narrow, window when a search lands at the same moment an
+    upload completes. Rather than re-checking existence (same race, smaller
+    window), this retries once against whichever path is current: a
+    FileNotFoundError here means the file just got renamed out from under the
+    first attempt, and the second call's readable_path() will find it under
+    its new name.
     """
-    path = readable_path(file_id)
-    if path is None:
-        return ""
-    with open(path, "rb") as fh:
-        fh.seek(start)
-        raw = fh.read(max(0, end - start))
-    return raw.decode("utf-8", errors="replace")
+    for attempt in range(2):
+        path = readable_path(file_id)
+        if path is None:
+            return ""
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                raw = fh.read(max(0, end - start))
+            return raw.decode("utf-8", errors="replace")
+        except FileNotFoundError:
+            if attempt == 1:
+                raise
+    return ""  # unreachable; satisfies type checkers
 
 
 def delete_all(file_id: str) -> None:

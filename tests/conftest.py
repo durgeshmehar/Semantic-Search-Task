@@ -65,10 +65,12 @@ def _drop_test_collections() -> None:
 
 @pytest.fixture
 def client(isolated_env, monkeypatch):
-    """TestClient with background workers disabled.
+    """TestClient with background workers disabled and a default test identity.
 
     Tests drain the queue explicitly via worker.drain_once() so indexing is
-    deterministic rather than racing a pool.
+    deterministic rather than racing a pool. The X-User-Id default means most
+    tests don't need to think about identity at all; ownership tests override
+    it per-request via `headers={"X-User-Id": ...}`.
     """
     from fastapi.testclient import TestClient
 
@@ -78,7 +80,7 @@ def client(isolated_env, monkeypatch):
     monkeypatch.setattr(worker, "start_workers", lambda: None)
     monkeypatch.setattr(worker, "stop_workers", lambda: None)
 
-    with TestClient(main.app) as test_client:
+    with TestClient(main.app, headers={"X-User-Id": "test-user"}) as test_client:
         yield test_client
 
 
@@ -108,7 +110,7 @@ def sample_text() -> bytes:
 
 
 def upload_file(client, data: bytes, filename: str = "test.log", chunk_size: int = 4096) -> str:
-    """Upload bytes in chunks and return the file_id."""
+    """Upload bytes in chunks, complete the upload, and return the file_id."""
     response = client.post(
         "/files", json={"filename": filename, "total_size": len(data)}
     )
@@ -125,5 +127,8 @@ def upload_file(client, data: bytes, filename: str = "test.log", chunk_size: int
         )
         assert response.status_code == 200, response.text
         offset += len(piece)
+
+    response = client.post(f"/files/{file_id}/complete")
+    assert response.status_code == 200, response.text
 
     return file_id

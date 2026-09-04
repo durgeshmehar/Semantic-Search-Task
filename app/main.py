@@ -58,14 +58,19 @@ app = FastAPI(
     description=(
         "Upload text files up to 10 GB on a 4 GB machine, resume interrupted "
         "uploads, and search their contents in natural language.\n\n"
+        "Every request takes an `X-User-Id` header identifying the caller "
+        "(any string; omit it and requests share one anonymous identity). "
+        "Files are scoped to their owner -- listing, status, search, and "
+        "delete only see files created under the same `X-User-Id`.\n\n"
         "**Upload flow**\n"
         "1. `POST /files` to register the upload and get a `file_id`.\n"
         "2. `PUT /files/{file_id}/chunk?offset=N` repeatedly with raw chunk bodies.\n"
-        "3. `GET /files/{file_id}/status` to watch progress -- or, after an "
+        "3. `POST /files/{file_id}/complete` once every chunk has been sent.\n"
+        "4. `GET /files/{file_id}/status` to watch progress -- or, after an "
         "interruption, to learn the offset to resume from.\n"
-        "4. `POST /files/{file_id}/search` once `searchable` is true.\n\n"
+        "5. `POST /files/{file_id}/search` once `searchable` is true.\n\n"
         "Indexing runs during the upload, so passages become searchable before "
-        "the last byte arrives."
+        "`complete` is even called."
     ),
 )
 

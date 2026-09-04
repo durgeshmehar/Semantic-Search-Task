@@ -13,10 +13,12 @@ class CreateUploadRequest(BaseModel):
     filename: str = Field(..., min_length=1, max_length=512, examples=["server.log"])
     total_size: int = Field(
         ...,
-        ge=0,
+        gt=0,
         le=config.MAX_FILE_BYTES,
-        description="Full size of the file in bytes, known up front so the "
-        "server can validate completion and report progress.",
+        description="Expected size of the file in bytes, used to size "
+        "passages and report progress. A hint, not a completion signal -- "
+        "call POST /files/{file_id}/complete when done sending chunks "
+        "regardless of whether bytes_received matches this exactly.",
         examples=[1048576],
     )
 
@@ -51,11 +53,13 @@ class FileStatus(BaseModel):
     """
 
     file_id: str
+    owner_id: str
     filename: str
     total_size: int
     bytes_received: int
     upload_status: str = Field(
-        ..., description="pending | uploading | interrupted | completed | failed"
+        ...,
+        description="pending | uploading | finalizing | interrupted | completed",
     )
     upload_progress: float = Field(..., ge=0.0, le=1.0)
     processing_status: str = Field(
