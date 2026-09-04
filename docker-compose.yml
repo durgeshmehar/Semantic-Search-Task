@@ -16,7 +16,12 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1.5G
+          # The assignment specifies 4 GB for the whole service, not per
+          # container -- this and the api container's limit below must sum
+          # to 4G, not each independently target 4G. Split 1.25G/2.75G to
+          # match measured usage (see README section 1) rather than round
+          # numbers picked in isolation.
+          memory: 1.25G
     healthcheck:
       test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
       interval: 10s
@@ -42,16 +47,18 @@ services:
       DATA_DIR: /app/data
       QDRANT_URL: http://qdrant:6333
       WORKER_COUNT: "2"
+      MAX_CONCURRENT_UPLOADS: "${MAX_CONCURRENT_UPLOADS:-50}"
       EMBED_BATCH_SIZE: "32"
       MAX_CHUNK_BYTES: "16777216"
-    # The assignment's constraint, enforced rather than assumed: the container
-    # is capped at 4 GB, so an accidental full-file read fails here instead of
-    # silently passing on a larger development machine. Qdrant runs in its own
-    # container with its own limit above, so this is the API + worker budget.
+    # The assignment's 4 GB constraint applies to the whole service, so this
+    # limit and Qdrant's above are sized to sum to 4G total, not 4G each.
+    # Enforced rather than assumed: an accidental full-file read or a memory
+    # leak hits this ceiling and gets OOM-killed here instead of silently
+    # passing on a larger development machine.
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 2.75G
     restart: unless-stopped
 
   # Runs the suite against the same image, then exits. `--profile test` keeps

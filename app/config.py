@@ -34,6 +34,15 @@ MAX_CHUNK_BYTES = _int_env("MAX_CHUNK_BYTES", 16 * 1024 * 1024)
 # Ceiling on a single upload, per the assignment.
 MAX_FILE_BYTES = _int_env("MAX_FILE_BYTES", 10 * 1024 * 1024 * 1024)
 
+# How many chunk PUTs may be held in memory at once, across all uploads.
+# Nothing else bounds this: MAX_CHUNK_BYTES caps one request, WORKER_COUNT
+# caps embedding, but without this a burst of concurrent uploads has no
+# ceiling and can push the container toward its memory limit. 50 concurrent
+# uploads at the default 16 MB chunk size is ~800 MB -- comfortably inside
+# the container's budget alongside the model and workers (see README
+# section 1), with headroom to raise it if MAX_CHUNK_BYTES is lowered.
+MAX_CONCURRENT_UPLOADS = _int_env("MAX_CONCURRENT_UPLOADS", 50)
+
 # --- Passage chunking -----------------------------------------------------
 
 # Target passage size in bytes. ~600 B is a handful of log lines or a short

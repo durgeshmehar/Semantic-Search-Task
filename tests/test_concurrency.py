@@ -50,6 +50,34 @@ def test_concurrent_puts_at_the_same_offset_do_not_duplicate_bytes(client):
     assert storage.current_size(file_id) == len(payload)
 
 
+def test_chunk_upload_returns_503_when_no_upload_slot_is_free(client, monkeypatch):
+    """The HTTP wiring for the concurrent-upload cap, not just the semaphore.
+
+    Confirms upload_chunk actually surfaces TooManyConcurrentUploads as a 503
+    with Retry-After, by holding every slot open before making a real request
+    through the app -- rather than only testing the semaphore in isolation
+    (see test_upload_limiter.py for that).
+    """
+    from app import upload_limiter
+
+    monkeypatch.setattr(upload_limiter.config, "MAX_CONCURRENT_UPLOADS", 1)
+    monkeypatch.setattr(upload_limiter, "_semaphore", threading.Semaphore(1))
+
+    response = client.post(
+        "/files", json={"filename": "full.log", "total_size": 10}
+    )
+    file_id = response.json()["file_id"]
+
+    with upload_limiter.acquire():  # the one slot is now held
+        response = client.put(
+            f"/files/{file_id}/chunk", params={"offset": 0}, content=b"x" * 10
+        )
+
+    assert response.status_code == 503
+    assert "Retry-After" in response.headers
+    assert response.json()["detail"]  # names the reason, not a bare 503
+
+
 def test_concurrent_puts_at_different_offsets_both_eventually_succeed(client):
     """Sequential (non-racing) chunks are unaffected by the transaction change."""
     data = b"a" * 3000 + b"b" * 3000

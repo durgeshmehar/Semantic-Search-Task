@@ -17,7 +17,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
-from . import config, db, models, storage, vector_store
+from . import config, db, models, storage, upload_limiter, vector_store
 from .identity import get_user_id
 from .pipeline import job_queue
 from .pipeline.line_buffer import LineBuffer
@@ -121,6 +121,10 @@ def create_upload(
         404: {"model": models.ErrorResponse, "description": "Unknown file"},
         409: {"model": models.ErrorResponse, "description": "Offset mismatch"},
         413: {"model": models.ErrorResponse, "description": "Chunk too large"},
+        503: {
+            "model": models.ErrorResponse,
+            "description": "Too many uploads in progress; retry shortly",
+        },
     },
 )
 async def upload_chunk(
@@ -148,7 +152,30 @@ async def upload_chunk(
     write lock up front, so the second request blocks until the first commits,
     then sees the advanced bytes_received and correctly fails its own check
     rather than double-appending.
+
+    A fixed number of concurrent chunk uploads may hold their body in memory
+    at once (config.MAX_CONCURRENT_UPLOADS), the same way embedding is capped
+    at a fixed worker count. Past that limit, this returns 503 with
+    Retry-After rather than accepting an unbounded number of requests each
+    holding up to MAX_CHUNK_BYTES -- the failure mode without a cap is a
+    memory spike big enough to have the whole container OOM-killed, taking
+    every in-flight request down with it, not just the excess uploads.
     """
+    try:
+        with upload_limiter.acquire():
+            return await _handle_chunk(file_id, request, offset, user_id)
+    except upload_limiter.TooManyConcurrentUploads as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            str(exc),
+            headers={"Retry-After": str(upload_limiter.RETRY_AFTER_SECONDS)},
+        )
+
+
+async def _handle_chunk(
+    file_id: str, request: Request, offset: int, user_id: str
+) -> models.ChunkUploadResponse:
+    """The actual chunk-append logic, run while an upload slot is held."""
     body = await request.body()
     if len(body) > config.MAX_CHUNK_BYTES:
         raise HTTPException(

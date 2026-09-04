@@ -150,8 +150,20 @@ under 1 GB regardless of file size:
 | ≤1 GB | 600 B | ≤0.8 GB |
 | 10 GB | 4,800 B | 1.0 GB |
 
-**Peak memory (10 GB file):** ~640 MB Python/torch/model + ~300 MB workers + ~170 MB uploads +
-~100 MB SQLite + ~1.0 GB Qdrant's resident vectors ≈ **~2.2 GB**, split across two containers.
+The 4 GB budget applies to the whole service, not per container, so the two containers' Docker
+memory limits are sized to sum to 4 GB: **API 2.75G, Qdrant 1.25G**
+([docker-compose.yml](docker-compose.yml)) — hitting either ceiling gets that container OOM-killed
+rather than silently degrading the host. Measured against those limits under a real 22.7 MB /
+44,542-passage upload (`docker stats` sampled continuously through upload and indexing): the API
+container ran 330 MB–890 MB (12–32% of its limit) and Qdrant stayed under 90 MB (7% of its limit).
+
+Nothing bounds concurrent embedding beyond the fixed worker count, but chunk *acceptance* had no
+equivalent ceiling — an unbounded burst of concurrent `PUT /chunk` requests, each holding up to
+`MAX_CHUNK_BYTES` in memory, could add up past the API container's limit with nothing pushing back,
+and a container OOM-kill takes down every in-flight request, not just the excess ones.
+`MAX_CONCURRENT_UPLOADS` (default 50, see [app/upload_limiter.py](app/upload_limiter.py)) caps
+this the same way `WORKER_COUNT` caps embedding: past the limit, a chunk PUT gets `503` with
+`Retry-After` immediately, rather than being queued or silently slowing the container down.
 
 ### 2. Interrupted uploads
 
@@ -168,8 +180,11 @@ byte count once `/complete` runs, and a client may send more than it originally 
 ### 3. Multiple concurrent uploads
 
 Each upload is independent: its own `.partial` file, line-buffer state, and Qdrant collection. A
-fixed worker pool caps concurrent embedding regardless of how many uploads are in flight, and SQLite
-in WAL mode lets uploads write while workers read.
+fixed worker pool caps concurrent embedding regardless of how many uploads are in flight, SQLite in
+WAL mode lets uploads write while workers read, and a semaphore
+(`MAX_CONCURRENT_UPLOADS`, §1) caps how many chunk PUTs may be held in memory at once, so a burst
+of simultaneous uploads gets a `503`/`Retry-After` past the limit instead of risking the container's
+memory ceiling.
 
 Two requests for the *same* file at the *same* offset — what a client's retry logic produces when a
 response is lost after the server already applied it — are serialized, not raced: the whole
@@ -227,6 +242,7 @@ a boundary isn't embedded as two meaningless fragments.
 | Module | Responsibility |
 |---|---|
 | [app/upload.py](app/upload.py) | Chunked upload, completion, offset validation, status |
+| [app/upload_limiter.py](app/upload_limiter.py) | Caps concurrent chunk uploads held in memory |
 | [app/identity.py](app/identity.py) | `X-User-Id` → caller id, for ownership scoping |
 | [app/search.py](app/search.py) | Query embedding, Qdrant lookup, byte-range reads |
 | [app/pipeline/line_buffer.py](app/pipeline/line_buffer.py) | Bytes → line-aligned passage ranges |
@@ -248,6 +264,8 @@ docker compose --profile test run --rm tests
 - **`test_line_buffer.py`** — lossless passage tiling under arbitrary splits; UTF-8 boundaries.
 - **`test_upload.py`** — chunked upload, interruption, resume, completion, ownership isolation.
 - **`test_concurrency.py`** — racing identical chunk requests: exactly one succeeds.
+- **`test_upload_limiter.py`** — the concurrent-upload cap: peak concurrent holders never exceeds
+  the limit, a full set of slots rejects cleanly, a released slot is reusable.
 - **`test_job_queue.py`** — exclusive claiming, retry-then-fail, crash recovery.
 - **`test_config.py`** — a 10 GB file's resident footprint stays within budget.
 - **`test_search.py`** — the assignment's example, ranking, byte offsets, search mid-upload.
@@ -256,7 +274,9 @@ Also verified by hand against the running stack: `docker kill` on the API mid-up
 resume → md5-identical file; Qdrant's on-disk/quantization config confirmed live via `curl`; a
 second `X-User-Id` gets `404` on someone else's file from every route; paraphrased queries
 (`"running out of storage space"` → `"No space left on device"`, no shared words) retrieving the
-right section.
+right section; memory sampled live via `docker stats` through a real 22.7 MB upload, staying well
+under both containers' limits; and, with `MAX_CONCURRENT_UPLOADS` set to 3, firing 8 concurrent 8 MB
+chunk uploads resulted in exactly 3 accepted and 5 rejected with `503`/`Retry-After` in ~30ms each.
 
 ---
 
